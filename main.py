@@ -12,6 +12,7 @@
 import argparse
 import sys
 from pathlib import Path
+import numpy as np
 
 import cv2
 
@@ -26,6 +27,10 @@ DEFAULT_MODEL  = "yolo11n.pt"   # Swap for yolo11s.pt / yolo11m.pt as needed
 OUTPUT_DIR     = Path("data/output_videos")
 WINDOW_NAME    = "SafePath AI – Invisible Corridor"
 
+# 1. Define 4 points in the video (x, y)
+SRC_PTS = np.array([[450, 600], [1400, 600], [1800, 1000], [100, 1000]], dtype=np.float32)
+
+DST_PTS = np.array([[0, 0], [1000, 0], [1000, 1500], [0, 1500]], dtype=np.float32)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SafePath AI – collision prediction")
@@ -71,6 +76,10 @@ def main() -> None:
     # ── Open video source ────────────────────────────────────────────────────
     cap = open_video(args.source)
 
+    # Calculate Homography Matrix (Image -> Ground) and Inverse (Ground -> Image)
+    H, _ = cv2.findHomography(SRC_PTS, DST_PTS)
+    H_inv, _ = cv2.findHomography(DST_PTS, SRC_PTS)
+
     # ── Optional output writer ───────────────────────────────────────────────
     writer = None
     if args.save:
@@ -98,15 +107,41 @@ def main() -> None:
         detections = tracker.track_frame(frame)
 
         # ── 2. Update predictor with new positions ────────────────────────────
+        #for det in detections:
+            #predictor.update(det["track_id"], det["center"])
+
+        # ── 2. Update predictor with GROUND positions ────────────────────────
         for det in detections:
-            predictor.update(det["track_id"], det["center"])
+            # a. Prepare the pixel coordinate
+            px_coord = np.array([[[det["center"][0], det["center"][1]]]], dtype=np.float32)
+            
+            # b. Transform pixel -> ground
+            ground_coord = cv2.perspectiveTransform(px_coord, H)[0][0]
+            
+            # c. Update predictor with ground units
+            predictor.update(det["track_id"], (int(ground_coord[0]), int(ground_coord[1])))    
 
         # ── 3. Build history & prediction maps keyed by track_id ─────────────
-        histories   = {det["track_id"]: predictor.get_history(det["track_id"])
-                       for det in detections}
-        predictions = {det["track_id"]: predictor.predict(det["track_id"], fps)
-                       for det in detections}
+        #histories   = {det["track_id"]: predictor.get_history(det["track_id"])
+                     #for det in detections}
+        #predictions = {det["track_id"]: predictor.predict(det["track_id"], fps)
+                       #for det in detections} 
+        # ── 3. Build history & prediction maps (and transform back to pixels) ─
+        raw_histories   = {det["track_id"]: predictor.get_history(det["track_id"]) for det in detections}
+        raw_predictions = {det["track_id"]: predictor.predict(det["track_id"], fps) for det in detections}
 
+        histories = {}
+        predictions = {}
+
+        for tid, path in raw_histories.items():
+            if not path: continue
+            pts = np.array([path], dtype=np.float32)
+            histories[tid] = cv2.perspectiveTransform(pts, H_inv)[0].astype(int).tolist()
+
+        for tid, path in raw_predictions.items():
+            if not path: continue
+            pts = np.array([path], dtype=np.float32)
+            predictions[tid] = cv2.perspectiveTransform(pts, H_inv)[0].astype(int).tolist()
         # ── 4. Render the annotated frame ─────────────────────────────────────
         annotated = draw_frame(frame, detections, histories, predictions)
 
