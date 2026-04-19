@@ -1,85 +1,128 @@
-# src/tracker.py
-# SafePath AI - Object Detection & Tracking Module
-# Uses YOLOv11 (via ultralytics) to detect 'person' and 'Forklift' (truck proxy)
-# Returns track IDs and center coordinates for every detected object simultaneously.
+# src/predictor.py
+# SafePath AI - Advanced Trajectory Prediction Module
+# Uses a Constant Velocity Kalman Filter for smoothing and 
+# calculates dynamic braking distances based on real-world physics.
 
-from ultralytics import YOLO
+import cv2
 import numpy as np
+from collections import deque
 
-# YOLO class indices for COCO dataset.
-# The COCO 'truck' class (7) serves as the forklift proxy.
-# Display label is 'Forklift' for clarity in the warehouse context.
-TRACKED_CLASSES = {
-    0: "person",
-    7: "Forklift",  # Renamed from 'truck' – displayed as 'Forklift' everywhere
-}
+# ── Safety & Physics Constants ───────────────────────────────────────────────
+# These reflect professional safety standards, similar to Kavach systems.
+REACTION_TIME_SEC  = 0.8   # System + Driver reaction time (seconds)
+FRICTION_COEFF     = 0.3   # Average friction for warehouse concrete floors
+GRAVITY            = 980.6 # cm/s^2 (Standard for centimeter-based units)
+MIN_VELOCITY_UNIT  = 2.0   # Threshold to ignore stationary noise (cm/frame)
+SMOOTHING_WINDOW   = 15    # Number of frames for visual history trail
 
-class ObjectTracker:
+class TrajectoryPredictor:
     """
-    Wraps YOLOv11 with ByteTrack for unlimited multi-object tracking (MOT).
-    All detected 'person' and 'Forklift' instances are tracked simultaneously
-    with no per-frame cap on the number of active tracks.
+    Advanced predictor utilizing a Kalman Filter for state estimation
+    and dynamic path projection based on braking physics.
     """
 
-    def __init__(self, model_path: str = "yolo11n.pt", confidence: float = 0.4):
+    def __init__(self):
+        # Maps track_id -> cv2.KalmanFilter object
+        self.kalmans = {}
+        # Maps track_id -> deque of ground coordinates for visual history
+        self._histories = {}
+
+    def _init_kalman(self, initial_x, initial_y):
         """
-        Args:
-            model_path: Path or name of the YOLOv11 model weights.
-            confidence: Minimum confidence threshold for detections.
+        Initializes a 4-state Kalman Filter: [x, y, vx, vy]
         """
-        print(f"[Tracker] Loading model: {model_path}")
-        self.model = YOLO(model_path)
-        self.confidence = confidence
-        self.class_ids = list(TRACKED_CLASSES.keys())  # [0, 7]
+        # 4 state variables (x, y, vx, vy), 2 measurement variables (x, y)
+        kf = cv2.KalmanFilter(4, 2)
+        
+        # State Transition Matrix (F): Constant Velocity Model
+        # x_new = x + vx, y_new = y + vy
+        kf.transitionMatrix = np.array([[1, 0, 1, 0],
+                                        [0, 1, 0, 1],
+                                        [0, 0, 1, 0],
+                                        [0, 0, 0, 1]], np.float32)
 
-    def track_frame(self, frame: np.ndarray) -> list[dict]:
+        # Measurement Matrix (H): We only observe (x, y) ground positions
+        kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                         [0, 1, 0, 0]], np.float32)
+
+        # Process Noise Covariance (Q): Trust in the physics model
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.05
+        
+        # Measurement Noise Covariance (R): Trust in YOLO detections
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.1
+
+        # Error Covariance (P): Initial state uncertainty
+        kf.errorCovPost = np.eye(4, dtype=np.float32)
+
+        # Initial State: Start at the detected ground point with zero initial velocity
+        kf.statePost = np.array([[initial_x], [initial_y], [0], [0]], np.float32)
+        
+        return kf
+
+    def update(self, track_id: int, ground_coord: tuple[int, int]) -> None:
         """
-        Run detection + tracking on a single BGR frame.
-        All instances of every tracked class are returned – no object limit.
-
-        Args:
-            frame: OpenCV BGR image (numpy array).
-
-        Returns:
-            List of dicts, each containing:
-                - 'track_id' (int): Unique persistent ID from ByteTrack
-                - 'label'    (str): 'person' or 'Forklift'
-                - 'center'   (tuple[int, int]): (cx, cy) in pixel coords
-                - 'bbox'     (tuple[int,int,int,int]): (x1, y1, x2, y2)
+        Update the state estimate using the Kalman Predict/Correct cycle.
         """
-        results = self.model.track(
-            frame,
-            persist=True,               # Maintain track IDs across frames
-            classes=self.class_ids,     # Only detect person & Forklift (truck)
-            conf=self.confidence,
-            tracker="bytetrack.yaml",   # Robust multi-object tracker
-            max_det=1000,               # High cap → effectively unlimited MOT
-            verbose=False,
-        )
+        gx, gy = ground_coord
 
-        detections = []
+        if track_id not in self.kalmans:
+            self.kalmans[track_id] = self._init_kalman(gx, gy)
+            self._histories[track_id] = deque(maxlen=SMOOTHING_WINDOW)
 
-        if results and results[0].boxes is not None:
-            boxes = results[0].boxes
+        # 1. Kalman Predict Phase: Project state based on physics
+        self.kalmans[track_id].predict()
 
-            for box in boxes:
-                # Skip if ByteTrack hasn't assigned an ID yet
-                if box.id is None:
-                    continue
+        # 2. Kalman Correct Phase: Update state with new detection
+        measurement = np.array([[np.float32(gx)], [np.float32(gy)]])
+        self.kalmans[track_id].correct(measurement)
 
-                track_id  = int(box.id.item())
-                class_id  = int(box.cls.item())
-                label     = TRACKED_CLASSES.get(class_id, "unknown")
+        # Store for history trail (Bird's Eye View coordinates)
+        self._histories[track_id].append((gx, gy))
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
+    def predict(self, track_id: int, fps: float) -> list[tuple[int, int]]:
+        """
+        Predicts the path using Dynamic Braking Distance logic.
+        """
+        if track_id not in self.kalmans:
+            return []
 
-                detections.append({
-                    "track_id": track_id,
-                    "label":    label,
-                    "center":   (cx, cy),
-                    "bbox":     (x1, y1, x2, y2),
-                })
+        kf = self.kalmans[track_id]
+        state = kf.statePost # Current estimated [x, y, vx, vy]
+        
+        vx, vy = state[2][0], state[3][0]
+        speed_per_frame = np.sqrt(vx**2 + vy**2)
+        
+        # Convert speed to units per second (e.g., cm/s)
+        speed_per_sec = speed_per_frame * fps
 
-        return detections
+        if speed_per_frame < MIN_VELOCITY_UNIT:
+            return [] # Stationary filter
+
+        # ── Dynamic Braking Calculation ──────────────────────────────────────
+        # Derived from industrial safety principles (Kavach).
+        # Total distance = (Reaction Distance) + (Braking Distance)
+        # d = (v * t_reaction) + (v^2 / (2 * friction * gravity))
+        
+        reaction_dist = speed_per_sec * REACTION_TIME_SEC
+        braking_dist  = (speed_per_sec**2) / (2 * FRICTION_COEFF * GRAVITY)
+        total_dist_ground = reaction_dist + braking_dist
+        
+        # Map physical distance back to frame-based prediction length
+        predict_frames = int(round(total_dist_ground / speed_per_frame))
+
+        # Project the linear path forward from the current state
+        curr_x, curr_y = state[0][0], state[1][0]
+        future = [
+            (int(curr_x + vx * t), int(curr_y + vy * t))
+            for t in range(1, predict_frames + 1)
+        ]
+        return future
+
+    def get_history(self, track_id: int) -> list[tuple[int, int]]:
+        """Returns the smoothed ground-coordinate history."""
+        return list(self._histories.get(track_id, []))
+
+    def remove(self, track_id: int) -> None:
+        """Cleanup for objects no longer in frame."""
+        self.kalmans.pop(track_id, None)
+        self._histories.pop(track_id, None)
